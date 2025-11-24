@@ -37,8 +37,11 @@ export function filterProfanity(text: string): { filtered: string; hasProfanity:
 }
 
 export function sanitizeText(text: string): string {
+  // Strip HTML tags
+  let sanitized = text.replace(/<[^>]*>/g, '');
+  
   // Remove control characters except newlines and tabs
-  let sanitized = text.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
+  sanitized = sanitized.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
   
   // Limit length
   const MAX_LENGTH = 280;

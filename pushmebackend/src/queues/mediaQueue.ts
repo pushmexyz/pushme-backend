@@ -70,9 +70,26 @@ export async function addMediaToQueue(
     },
   });
 
+  // Create a promise that resolves when the job completes
+  // Note: This is a workaround for BullMQ v5 API changes
+  const promise = new Promise<{ url: string; metadata: any }>((resolve, reject) => {
+    const checkJob = async () => {
+      const jobState = await job.getState();
+      if (jobState === 'completed') {
+        const result = await job.returnvalue;
+        resolve(result);
+      } else if (jobState === 'failed') {
+        reject(new Error('Job failed'));
+      } else {
+        setTimeout(checkJob, 500);
+      }
+    };
+    checkJob();
+  });
+
   return {
     jobId: job.id!,
-    promise: job.waitUntilFinished() as Promise<{ url: string; metadata: any }>,
+    promise,
   };
 }
 

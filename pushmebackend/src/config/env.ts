@@ -5,7 +5,7 @@ dotenv.config({ path: '.env.local' });
 dotenv.config(); // This will override with .env if it exists
 
 export const config = {
-  port: parseInt(process.env.PORT || '5001', 10),
+  port: parseInt(process.env.PORT || '5001', 10), // Default to 5001 as per spec
   
   supabase: {
     url: process.env.SUPABASE_URL || '',

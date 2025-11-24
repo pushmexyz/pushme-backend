@@ -22,24 +22,25 @@ export const supabase = createClient(
   }
 );
 
-// Database types
+// Database types matching the real Supabase schema
 export interface User {
   id: string;
   wallet: string;
   username: string | null;
   created_at: string;
-  updated_at?: string; // Optional - may not exist in all schemas
+  updated_at?: string;
 }
 
 export interface Donation {
   id: string;
   wallet: string;
-  username: string;
-  type: 'text' | 'gif' | 'image' | 'audio' | 'video';
+  username: string | null;
+  type: string;
   media_url: string | null;
   text: string | null;
   price: number;
   tx_hash: string;
+  metadata?: any;
   created_at: string;
 }
 

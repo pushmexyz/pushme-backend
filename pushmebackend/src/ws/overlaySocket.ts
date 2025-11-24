@@ -1,9 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { config } from '../config/env';
-import { logger } from '../utils/logger';
-import { setBroadcastFunction } from '../services/overlayEventService';
-import { OverlayEvent, DonationEventPayload } from '../types/OverlayEventTypes';
-import { DonationType } from '../types/DonationTypes';
+import { OverlayEvent } from '../types/OverlayEvents';
 
 interface AuthenticatedWebSocket extends WebSocket {
   isAuthenticated?: boolean;
@@ -12,7 +9,7 @@ interface AuthenticatedWebSocket extends WebSocket {
 }
 
 let wss: WebSocketServer | null = null;
-const connectedClients = new Set<AuthenticatedWebSocket>();
+const overlayClients = new Set<WebSocket>();
 
 export function createOverlaySocketServer(server: any): WebSocketServer {
   wss = new WebSocketServer({
@@ -21,7 +18,7 @@ export function createOverlaySocketServer(server: any): WebSocketServer {
   });
 
   wss.on('connection', (ws: AuthenticatedWebSocket) => {
-    // Reduced logging - only log authentication
+    ws.isAlive = true;
 
     ws.on('message', (message: Buffer) => {
       try {
@@ -34,23 +31,21 @@ export function createOverlaySocketServer(server: any): WebSocketServer {
           if (key === config.overlay.secret) {
             ws.isAuthenticated = true;
             ws.overlayKey = key;
-            connectedClients.add(ws);
-            logger.info('[OVERLAY] ✅ WebSocket client connected and authenticated');
+            overlayClients.add(ws);
+            console.info('[OVERLAY] WebSocket client authenticated');
 
             ws.send(
               JSON.stringify({
-                event: 'AUTH_SUCCESS',
-                payload: { message: 'Authenticated successfully' },
-                timestamp: Date.now(),
+                type: 'auth_success',
+                message: 'Authenticated successfully',
               })
             );
           } else {
-            logger.warn('Invalid overlay key attempted');
+            console.warn('[OVERLAY] Invalid authentication key attempted');
             ws.send(
               JSON.stringify({
-                event: 'AUTH_FAILED',
-                payload: { message: 'Invalid authentication key' },
-                timestamp: Date.now(),
+                type: 'auth_failed',
+                message: 'Invalid authentication key',
               })
             );
             ws.close();
@@ -60,38 +55,31 @@ export function createOverlaySocketServer(server: any): WebSocketServer {
 
         // Only process messages from authenticated clients
         if (!ws.isAuthenticated) {
-          logger.warn('Message received from unauthenticated client');
+          console.warn('[OVERLAY] Message from unauthenticated client');
           ws.close();
           return;
         }
-
-        // Handle other message types if needed
-        logger.debug('Message from overlay:', data);
       } catch (error) {
-        logger.error('Error processing WebSocket message:', error);
+        console.error('[OVERLAY] Error processing message:', error);
       }
     });
 
     ws.on('close', () => {
+      overlayClients.delete(ws);
       if (ws.isAuthenticated) {
-        connectedClients.delete(ws);
-        logger.info('[OVERLAY] WebSocket client disconnected');
+        console.info('[OVERLAY] WebSocket client disconnected');
       }
     });
 
     ws.on('error', (error) => {
-      logger.error('WebSocket error:', error);
-      if (ws.isAuthenticated) {
-        connectedClients.delete(ws);
-      }
+      console.error('[OVERLAY] WebSocket error:', error);
+      overlayClients.delete(ws);
     });
 
-    // Send ping to keep connection alive
+    // Ping/pong to keep connection alive
     const pingInterval = setInterval(() => {
       if (ws.isAlive === false) {
-        if (ws.isAuthenticated) {
-          connectedClients.delete(ws);
-        }
+        overlayClients.delete(ws);
         return ws.terminate();
       }
 
@@ -105,95 +93,95 @@ export function createOverlaySocketServer(server: any): WebSocketServer {
 
     ws.on('close', () => {
       clearInterval(pingInterval);
+      overlayClients.delete(ws);
     });
   });
 
-  // Set up broadcast function for overlay event service
-  setBroadcastFunction((event: OverlayEvent) => {
-    broadcastToOverlay(event);
-  });
-
-  logger.info('WebSocket server created on /overlay');
+  console.info('[OVERLAY] WebSocket server created on /overlay');
   return wss;
 }
 
-function broadcastToOverlay(event: OverlayEvent): void {
+/**
+ * Unified broadcast function for all overlay events
+ * Always uses JSON.stringify() and checks client.readyState === OPEN
+ */
+export function broadcastOverlayEvent(event: OverlayEvent): void {
   if (!wss) {
-    logger.warn('[OVERLAY] WebSocket server not initialized');
+    console.warn('[OVERLAY] WebSocket server not initialized');
     return;
   }
 
   const message = JSON.stringify(event);
   let sentCount = 0;
+  const deadClients: WebSocket[] = [];
 
-  connectedClients.forEach((client) => {
-    if (client.isAuthenticated && client.readyState === WebSocket.OPEN) {
+  overlayClients.forEach((client) => {
+    // Check if client is open before sending
+    if (client.readyState === WebSocket.OPEN) {
       try {
         client.send(message);
         sentCount++;
       } catch (error) {
-        logger.error('[OVERLAY] Error sending message to overlay client:', error);
-        connectedClients.delete(client);
+        console.error('[OVERLAY] Error sending message:', error);
+        deadClients.push(client);
       }
+    } else {
+      // Client is not open, mark for removal
+      deadClients.push(client);
     }
   });
 
-  // Only log if event was sent (reduces noise)
-  if (sentCount > 0 && (event.event === 'DONATION' || event.event === 'BUTTON_PRESS' || event.event === 'CHAOS_EFFECT')) {
-    logger.info(`[OVERLAY] 📡 Broadcasted ${event.event} to ${sentCount} client(s)`);
+  // Remove dead clients
+  deadClients.forEach((client) => {
+    overlayClients.delete(client);
+  });
+
+  if (sentCount > 0) {
+    console.info(`[OVERLAY] Broadcasting ${event.type} to ${sentCount} client(s)`);
   }
 }
 
 /**
- * Broadcasts a donation event directly to all connected overlay clients
- * This triggers immediate animation of the red button on the overlay
+ * Broadcast auth event (legacy support)
  */
-export function broadcastDonation(params: {
-  type: DonationType;
+export function broadcastAuthEvent(user: {
+  username: string | null;
   wallet: string;
-  content?: string;
-  amount: number;
-  signature: string;
-  username?: string;
-  donationId?: string;
-  createdAt?: string;
 }): void {
-  const payload: DonationEventPayload = {
-    id: params.donationId,
-    type: params.type,
-    media_url: params.type !== 'text' ? params.content || undefined : undefined,
-    text: params.type === 'text' ? params.content || undefined : undefined,
-    username: params.username || params.wallet,
-    wallet: params.wallet,
-    price: params.amount,
-    tx_hash: params.signature,
-    created_at: params.createdAt,
-    timestamp: Date.now(),
-  };
+  // Auth events are handled separately if needed
+  // This function kept for backward compatibility
+}
 
-  const event: OverlayEvent = {
-    event: 'DONATION',
-    payload,
-    timestamp: Date.now(),
-  };
-
-  broadcastToOverlay(event);
-  logger.info(`[OVERLAY] 🎉 Donation broadcasted: ${params.type} from ${params.username || params.wallet} (${params.amount} SOL)`);
+/**
+ * Broadcast donation event (uses unified broadcastOverlayEvent)
+ */
+export function broadcastDonationEvent(payload: {
+  type: 'donation';
+  wallet: string;
+  username: string;
+  amount: number;
+  message: string | null;
+  mediaUrl: string | null;
+  mediaType: 'text' | 'image' | 'gif' | 'audio' | 'video';
+  txHash: string;
+  timestamp: number;
+}): void {
+  broadcastOverlayEvent(payload);
 }
 
 export function getConnectedClientsCount(): number {
-  return connectedClients.size;
+  return overlayClients.size;
 }
 
 export function closeOverlaySocketServer(): void {
   if (wss) {
-    connectedClients.forEach((client) => {
+    overlayClients.forEach((client) => {
       client.close();
     });
-    connectedClients.clear();
+    overlayClients.clear();
     wss.close();
     wss = null;
-    logger.info('WebSocket server closed');
+    console.info('[OVERLAY] WebSocket server closed');
   }
 }
 

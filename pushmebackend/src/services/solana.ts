@@ -1,18 +1,16 @@
 import { Connection, PublicKey, Transaction, SystemProgram } from '@solana/web3.js';
 import { solanaConnection, treasuryPublicKey } from '../config/solana';
-import { logger } from '../utils/logger';
-import { DONATION_PRICES, DonationType } from '../types/DonationTypes';
 
 /**
  * Creates an unsigned transaction for a donation
+ * Sends amount SOL to treasury wallet
  */
 export async function createUnsignedTransaction(
   wallet: string,
-  amount: number,
-  type: DonationType
-): Promise<{ transaction: string; recentBlockhash: string }> {
+  amount: number
+): Promise<{ transaction: string }> {
   try {
-    logger.info(`[TX] Building unsigned transaction for wallet: ${wallet}, amount: ${amount} SOL, type: ${type}`);
+    // Logging handled in route
 
     if (!treasuryPublicKey) {
       throw new Error('Treasury wallet not configured');
@@ -23,7 +21,6 @@ export async function createUnsignedTransaction(
 
     // Get recent blockhash
     const recentBlockhash = await solanaConnection.getLatestBlockhash('finalized');
-    logger.info(`[TX] Recent blockhash obtained: ${recentBlockhash.blockhash.substring(0, 8)}...`);
 
     // Build the transaction
     const tx = new Transaction({
@@ -44,97 +41,101 @@ export async function createUnsignedTransaction(
     });
 
     const base64Tx = serialized.toString('base64');
-    logger.info(`[TX] Unsigned transaction created successfully (${base64Tx.length} bytes)`);
 
     return {
       transaction: base64Tx,
-      recentBlockhash: recentBlockhash.blockhash,
     };
   } catch (error: any) {
-    logger.error(`[TX] Error creating unsigned transaction:`, error);
+    console.error('[DONATION] Error creating unsigned transaction:', error);
     throw new Error(`Failed to create unsigned transaction: ${error.message}`);
   }
 }
 
 /**
  * Sends a signed transaction and confirms it
+ * Implements retry logic (3 attempts)
  */
 export async function sendSignedTransaction(
   signedTxBase64: string
 ): Promise<{ signature: string; confirmed: boolean }> {
-  try {
-    logger.info(`[TX] Signed transaction received`);
+  const maxRetries = 3;
+  let lastError: Error | null = null;
 
-    // Deserialize the signed transaction
-    const signedTxBuffer = Buffer.from(signedTxBase64, 'base64');
-    const signedTx = Transaction.from(signedTxBuffer);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Deserialize the signed transaction (base64 → buffer)
+      const signedTxBuffer = Buffer.from(signedTxBase64, 'base64');
+      const signedTx = Transaction.from(signedTxBuffer);
 
-    logger.info(`[TX] Broadcasting transaction...`);
+      // Broadcast the transaction (sendRawTransaction)
+      const signature = await solanaConnection.sendRawTransaction(signedTx.serialize(), {
+        skipPreflight: false,
+        maxRetries: 3,
+      });
 
-    // Broadcast the transaction
-    const signature = await solanaConnection.sendRawTransaction(signedTx.serialize(), {
-      skipPreflight: false,
-      maxRetries: 3,
-    });
+      // Confirm the transaction (confirmTransaction)
+      const confirmation = await confirmTransactionWithRetry(signature);
 
-    logger.info(`[TX] Transaction broadcasted with signature: ${signature}`);
-
-    // Confirm the transaction
-    logger.info(`[TX] Confirming transaction: ${signature}...`);
-    const confirmation = await confirmTransaction(signature);
-
-    if (!confirmation.confirmed) {
-      throw new Error(`Transaction confirmation failed: ${confirmation.error || 'Unknown error'}`);
+      if (confirmation.confirmed) {
+        return {
+          signature,
+          confirmed: true,
+        };
+      } else {
+        throw new Error(confirmation.error || 'Transaction confirmation failed');
+      }
+    } catch (error: any) {
+      lastError = error;
+      
+      // Log structured error summary (not full stack trace)
+      const errorMsg = error.message || String(error);
+      console.error(`[DONATION] Transaction attempt ${attempt} failed:`, errorMsg);
+      
+      if (attempt < maxRetries) {
+        // Wait before retry (exponential backoff)
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
     }
-
-    logger.info(`[TX] Confirmed: signature ${signature}`);
-
-    return {
-      signature,
-      confirmed: true,
-    };
-  } catch (error: any) {
-    logger.error(`[TX] Error sending signed transaction:`, error);
-    throw new Error(`Failed to send transaction: ${error.message}`);
   }
+
+  // All retries failed - preserve error for proper handling in route
+  throw lastError || new Error('Transaction failed after retries');
 }
 
 /**
- * Confirms a transaction with finalized commitment
+ * Confirms a transaction with retry logic
  */
-export async function confirmTransaction(
-  signature: string
+async function confirmTransactionWithRetry(
+  signature: string,
+  maxAttempts: number = 10
 ): Promise<{ confirmed: boolean; error?: string }> {
-  try {
-    logger.info(`[TX] Confirming transaction: ${signature}...`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const confirmation = await solanaConnection.confirmTransaction(signature, 'confirmed');
 
-    const confirmation = await solanaConnection.confirmTransaction(signature, 'finalized');
+      if (confirmation.value.err) {
+        return {
+          confirmed: false,
+          error: `Transaction failed: ${JSON.stringify(confirmation.value.err)}`,
+        };
+      }
 
-    if (confirmation.value.err) {
-      logger.error(`[TX] Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-      return {
-        confirmed: false,
-        error: `Transaction failed: ${JSON.stringify(confirmation.value.err)}`,
-      };
+      return { confirmed: true };
+    } catch (error: any) {
+      if (attempt === maxAttempts) {
+        return {
+          confirmed: false,
+          error: error.message,
+        };
+      }
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
-
-    logger.info(`[TX] Transaction confirmed successfully: ${signature}`);
-    return { confirmed: true };
-  } catch (error: any) {
-    logger.error(`[TX] Error confirming transaction:`, error);
-    return {
-      confirmed: false,
-      error: error.message,
-    };
   }
-}
 
-/**
- * Validates donation amount matches expected price for type
- */
-export function validateDonationAmount(amount: number, type: DonationType): boolean {
-  const expectedAmount = DONATION_PRICES[type];
-  // Allow small floating point differences (0.0001 SOL tolerance)
-  return Math.abs(amount - expectedAmount) < 0.0001;
+  return {
+    confirmed: false,
+    error: 'Transaction confirmation timeout',
+  };
 }
 

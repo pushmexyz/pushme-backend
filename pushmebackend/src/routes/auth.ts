@@ -1,236 +1,259 @@
 import { Router, Request, Response } from 'express';
-import jwt from 'jsonwebtoken';
-import { config } from '../config/env';
-import { supabase, User } from '../config/supabase';
-import { generateNonce, verifySignature } from '../utils/signature';
-import { validateAuthPayload } from '../utils/validator';
-import { logger } from '../utils/logger';
-import { AuthToken } from '../types/AuthTypes';
-import { v4 as uuidv4 } from 'uuid';
+import { PublicKey } from '@solana/web3.js';
+import { supabase } from '../config/supabase';
+import { validateUsername } from '../utils/validator';
+import { broadcastAuthEvent } from '../ws/overlaySocket';
 
 const router = Router();
 
-// Generate nonce for wallet authentication
-router.post('/nonce', async (req: Request, res: Response) => {
+/**
+ * POST /auth/wallet
+ * Check if user exists by wallet public key
+ * Always returns: { success: true, wallet, username, needsUsername }
+ */
+router.post('/wallet', async (req: Request, res: Response) => {
   try {
-    const { wallet } = req.body;
+    const { publicKey } = req.body;
 
-    logger.info(`[AUTH] POST /auth/nonce - wallet: ${wallet}`);
+    console.info('[AUTH] Wallet connected:', publicKey);
 
-    if (!wallet || typeof wallet !== 'string') {
-      return res.status(400).json({ error: 'Wallet address is required' });
+    // Validate publicKey
+    if (!publicKey || typeof publicKey !== 'string') {
+      return res.status(400).json({ 
+        success: false,
+        error: 'publicKey is required' 
+      });
     }
 
-    const { nonce, timestamp, message } = generateNonce(wallet);
+    // Validate Solana public key format
+    try {
+      new PublicKey(publicKey);
+    } catch (error) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid publicKey format' 
+      });
+    }
 
-    logger.info(`[AUTH] Nonce generated for wallet: ${wallet}`);
+    // Check Supabase for user by wallet
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('username, wallet')
+      .eq('wallet', publicKey)
+      .maybeSingle();
 
-    res.json({
-      nonce,
-      timestamp,
-      message,
+    if (error) {
+      console.error('[AUTH] Database error:', error);
+      return res.status(500).json({ 
+        success: false,
+        error: 'Database error' 
+      });
+    }
+
+    if (user) {
+      // User exists - check if username is null or empty
+      const hasUsername = user.username && user.username.trim().length > 0;
+      const needsUsername = !hasUsername;
+
+      console.info('[AUTH] User found:', user.username || 'no username');
+      console.info('[AUTH] Returning auth state → needsUsername:', needsUsername);
+
+      // If user has username, broadcast auth event
+      if (hasUsername) {
+        broadcastAuthEvent({
+          username: user.username,
+          wallet: publicKey,
+        });
+        console.info('[AUTH] Broadcast auth event');
+      }
+
+      // Always return consistent structure
+      return res.json({
+        success: true,
+        wallet: publicKey,
+        username: user.username || null,
+        needsUsername: needsUsername,
+      });
+    } else {
+      // User does not exist - needs username
+      console.info('[AUTH] User not found, needs username');
+      console.info('[AUTH] Returning auth state → needsUsername: true');
+
+      return res.json({
+        success: true,
+        wallet: publicKey,
+        username: null,
+        needsUsername: true,
+      });
+    }
+  } catch (error: any) {
+    console.error('[AUTH] Error in /auth/wallet:', error);
+    return res.status(500).json({ 
+      success: false,
+      error: 'Internal server error' 
     });
-  } catch (error) {
-    logger.error('[AUTH] Error generating nonce:', error);
-    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Verify signature and create JWT
-router.post('/verify', async (req: Request, res: Response) => {
+/**
+ * POST /auth/create-user
+ * Create new user with username
+ * Returns: { success: true, wallet, username, needsUsername: false }
+ */
+router.post('/create-user', async (req: Request, res: Response) => {
   try {
-    logger.info(`[AUTH] POST /auth/verify`);
+    const { publicKey, username } = req.body;
 
-    const validation = validateAuthPayload(req.body);
+    console.info('[AUTH] Create user request:', { publicKey, username });
 
-    if (!validation.success) {
-      logger.warn(`[AUTH] Validation failed: ${validation.error}`);
-      return res.status(400).json({ error: validation.error });
+    // Validate publicKey
+    if (!publicKey || typeof publicKey !== 'string') {
+      return res.status(400).json({ 
+        success: false,
+        error: 'publicKey is required' 
+      });
     }
 
-    const { wallet, signature, nonce, timestamp } = validation.data!;
-
-    logger.info(`[AUTH] Verifying signature for wallet: ${wallet}`);
-
-    // 1. Verify signature (includes nonce verification)
-    const isValid = verifySignature(wallet, signature, nonce, timestamp);
-
-    if (!isValid) {
-      logger.warn(`[AUTH] Invalid signature for wallet: ${wallet}`);
-      return res.status(401).json({ error: 'Invalid signature or expired nonce' });
+    // Validate username
+    const usernameValidation = validateUsername(username);
+    if (!usernameValidation.valid) {
+      return res.status(400).json({ 
+        success: false,
+        error: usernameValidation.error 
+      });
     }
 
-    // 2. Get existing user to preserve username (if exists)
+    // Validate Solana public key format
+    try {
+      new PublicKey(publicKey);
+    } catch (error) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid publicKey format' 
+      });
+    }
+
+    // Check if username already exists
     const { data: existingUser } = await supabase
       .from('users')
-      .select('username, id')
-      .eq('wallet', wallet)
+      .select('id')
+      .eq('username', username)
       .maybeSingle();
 
-    // 3. Upsert user in Supabase (creates if new, updates if exists)
-    // Preserve existing username if user already exists
-    const { data: user, error: upsertError } = await supabase
+    if (existingUser) {
+      console.warn('[AUTH] Username already taken:', username);
+      return res.status(409).json({ 
+        success: false,
+        error: 'Username already taken' 
+      });
+    }
+
+    // Check if wallet already exists
+    const { data: existingWallet } = await supabase
       .from('users')
-      .upsert(
-        {
-          wallet,
-          username: existingUser?.username || null, // Preserve existing username
-          created_at: existingUser ? undefined : new Date().toISOString(), // Only set on create
-        },
-        {
-          onConflict: 'wallet',
+      .select('id, username')
+      .eq('wallet', publicKey)
+      .maybeSingle();
+
+    if (existingWallet) {
+      // Wallet exists - update username if it's null/empty
+      if (!existingWallet.username || existingWallet.username.trim().length === 0) {
+        const { data: updatedUser, error: updateError } = await supabase
+          .from('users')
+          .update({ username: username })
+          .eq('wallet', publicKey)
+          .select()
+          .single();
+
+        if (updateError) {
+          console.error('[AUTH] Database error updating username:', updateError);
+          return res.status(500).json({ 
+            success: false,
+            error: 'Failed to update username',
+            details: updateError.message 
+          });
         }
-      )
+
+        console.info('[AUTH] Username updated for existing wallet:', username);
+        console.info('[AUTH] Returning auth state → needsUsername: false');
+
+        // Broadcast auth event
+        broadcastAuthEvent({
+          username: username,
+          wallet: publicKey,
+        });
+        console.info('[AUTH] Broadcast auth event');
+
+        return res.json({
+          success: true,
+          wallet: publicKey,
+          username: username,
+          needsUsername: false,
+        });
+      } else {
+        // Wallet exists with username - return existing user
+        console.info('[AUTH] Wallet already registered with username:', existingWallet.username);
+        console.info('[AUTH] Returning auth state → needsUsername: false');
+
+        broadcastAuthEvent({
+          username: existingWallet.username,
+          wallet: publicKey,
+        });
+        console.info('[AUTH] Broadcast auth event');
+
+        return res.json({
+          success: true,
+          wallet: publicKey,
+          username: existingWallet.username,
+          needsUsername: false,
+        });
+      }
+    }
+
+    // Insert new user into Supabase
+    const { data: newUser, error: insertError } = await supabase
+      .from('users')
+      .insert({
+        wallet: publicKey,
+        username: username,
+        created_at: new Date().toISOString(),
+      })
       .select()
       .single();
 
-    if (upsertError) {
-      logger.error('[AUTH] Database error during upsert:', upsertError);
+    if (insertError) {
+      console.error('[AUTH] Database error creating user:', insertError);
       return res.status(500).json({ 
-        error: 'Failed to create or update user',
-        details: upsertError.message 
+        success: false,
+        error: 'Failed to create user',
+        details: insertError.message 
       });
     }
 
-    if (!user) {
-      logger.error('[AUTH] User upsert returned no data');
-      return res.status(500).json({ error: 'Failed to retrieve user after upsert' });
-    }
+    console.info('[AUTH] New user created:', username);
+    console.info('[AUTH] Returning auth state → needsUsername: false');
 
-    if (existingUser) {
-      logger.info(`[AUTH] Existing user authenticated: ${user.id} (wallet: ${wallet})`);
-    } else {
-      logger.info(`[AUTH] New user created: ${user.id} (wallet: ${wallet})`);
-    }
-
-    // Create JWT (don't set exp manually - let jwt.sign handle it with expiresIn)
-    const tokenPayload: { wallet: string } = {
-      wallet,
-    };
-
-    const token = jwt.sign(tokenPayload, config.jwt.secret as string, {
-      expiresIn: config.jwt.expiresIn,
-    } as jwt.SignOptions);
-
-    logger.info(`[AUTH] User authenticated successfully: ${wallet}`);
-
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: user.id,
-        wallet: user.wallet,
-        username: user.username,
-      },
+    // Broadcast auth event via WebSocket
+    broadcastAuthEvent({
+      username: username,
+      wallet: publicKey,
     });
-  } catch (error) {
-    logger.error('[AUTH] Error verifying signature:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+    console.info('[AUTH] Broadcast auth event');
 
-// Get current user from JWT
-router.get('/me', async (req: Request, res: Response) => {
-  try {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-
-    const token = authHeader.substring(7);
-
-    try {
-      const decoded = jwt.verify(token, config.jwt.secret) as AuthToken;
-
-      // Fetch user from database
-      const { data: user, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('wallet', decoded.wallet)
-        .single();
-
-      if (error || !user) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      logger.info(`[AUTH] GET /auth/me - wallet: ${user.wallet}`);
-
-      res.json({
-        user: {
-          id: user.id,
-          wallet: user.wallet,
-          username: user.username,
-        },
-      });
-    } catch (jwtError) {
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-  } catch (error) {
-    logger.error('[AUTH] Error in /me endpoint:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// PATCH /auth/me - Update user profile (username)
-router.patch('/me', async (req: Request, res: Response) => {
-  try {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-
-    const token = authHeader.substring(7);
-
-    try {
-      const decoded = jwt.verify(token, config.jwt.secret) as AuthToken;
-      const wallet = decoded.wallet;
-      const { username } = req.body;
-
-      logger.info(`[AUTH] Updating username for wallet: ${wallet}, username: ${username}`);
-
-      // Validate username
-      if (username && (username.length < 3 || username.length > 20)) {
-        return res.status(400).json({ error: 'Username must be 3-20 characters' });
-      }
-
-      if (username && !/^[a-zA-Z0-9_]+$/.test(username)) {
-        return res.status(400).json({ error: 'Username can only contain letters, numbers, and underscores' });
-      }
-
-      // Update user in database
-      const { data, error } = await supabase
-        .from('users')
-        .update({ 
-          username: username || null,
-        })
-        .eq('wallet', wallet)
-        .select()
-        .single();
-
-      if (error) {
-        logger.error(`[AUTH] Database error:`, error);
-        return res.status(500).json({ error: 'Failed to update username' });
-      }
-
-      logger.info(`[AUTH] Username updated successfully`);
-
-      res.json({
-        user: {
-          id: data.id,
-          wallet: data.wallet,
-          username: data.username,
-        },
-      });
-    } catch (jwtError) {
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
+    // Return consistent structure
+    return res.json({
+      success: true,
+      wallet: publicKey,
+      username: newUser.username,
+      needsUsername: false,
+    });
   } catch (error: any) {
-    logger.error(`[AUTH] Unexpected error:`, error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('[AUTH] Error in /auth/create-user:', error);
+    return res.status(500).json({ 
+      success: false,
+      error: 'Internal server error' 
+    });
   }
 });
 
 export default router;
-

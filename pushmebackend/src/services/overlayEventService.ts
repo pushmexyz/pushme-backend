@@ -21,7 +21,7 @@ export function emitToOverlay(event: OverlayEvent): void {
   try {
     broadcastToOverlay(event);
     // Only log important events (donations, games, actions)
-    if (event.event === 'DONATION' || event.event === 'BUTTON_PRESS' || event.event === 'CHAOS_EFFECT' || event.event === 'GAME_START' || event.event === 'GAME_END') {
+    if (event.event === 'DONATION' || event.event === 'BUTTON_PRESS' || event.event === 'CHAOS_EFFECT') {
       logger.info(`[OVERLAY] Event broadcasted: ${event.event}`);
     }
   } catch (error) {
